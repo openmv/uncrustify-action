@@ -1,0 +1,219 @@
+name: 'Uncrustify Format Check'
+description: 'Run uncrustify on specified files with custom config'
+author: 'OpenMV'
+
+inputs:
+  config-path:
+    description: 'Path to uncrustify config file'
+    required: false
+    default: 'uncrustify.cfg'
+  
+  extensions:
+    description: 'File extensions to check (e.g., "c,h,cpp")'
+    required: true
+  
+  exclude-patterns:
+    description: 'Patterns to exclude (YAML list)'
+    required: false
+  
+  
+  fail-on-error:
+    description: 'Whether to fail the action if formatting issues are found'
+    required: true
+  
+  uncrustify-version:
+    description: 'Uncrustify version to use (e.g., "0.75.0")'
+    required: true
+
+outputs:
+  files-changed:
+    description: 'Number of files that needed formatting'
+    value: ${{ steps.uncrustify.outputs.files-changed }}
+  
+  formatting-needed:
+    description: 'Whether any files needed formatting (true/false)'
+    value: ${{ steps.uncrustify.outputs.formatting-needed }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Cache uncrustify
+      uses: actions/cache@v4.2.0
+      id: cache-uncrustify
+      with:
+        path: ~/uncrustify-cache/bin
+        key: uncrustify-${{ inputs.uncrustify-version }}
+
+    - name: Setup uncrustify
+      shell: bash
+      run: |
+        UNCRUSTIFY_VERSION="${{ inputs.uncrustify-version }}"
+        UNCRUSTIFY_PATH="$HOME/uncrustify-cache"
+        UNCRUSTIFY_URL="https://github.com/uncrustify/uncrustify/archive/uncrustify-${UNCRUSTIFY_VERSION}.tar.gz"
+        
+        if [ "${{ steps.cache-uncrustify.outputs.cache-hit }}" != "true" ]; then
+          echo "Installing uncrustify ${UNCRUSTIFY_VERSION}..."
+          
+          # Install build dependencies
+          sudo apt-get update
+          sudo apt-get install -y wget cmake build-essential colordiff
+          
+          # Create directories
+          mkdir -p "${UNCRUSTIFY_PATH}/src"
+          mkdir -p "${UNCRUSTIFY_PATH}/bin"
+          
+          # Download and extract
+          echo "Downloading ${UNCRUSTIFY_URL}"
+          wget --no-check-certificate -O - "${UNCRUSTIFY_URL}" | tar xvz --strip-components=1 -C "${UNCRUSTIFY_PATH}/src"
+          
+          # Build
+          cd "${UNCRUSTIFY_PATH}/src"
+          mkdir build && cd build
+          cmake ..
+          cmake --build . --parallel $(nproc)
+          
+          # Copy binary to cache
+          cp uncrustify "${UNCRUSTIFY_PATH}/bin/"
+          chmod +x "${UNCRUSTIFY_PATH}/bin/uncrustify"
+          
+          # Copy colordiff to cache
+          cp `which colordiff` "${UNCRUSTIFY_PATH}/bin/"
+        else
+          echo "Using cached uncrustify ${UNCRUSTIFY_VERSION}"
+        fi
+        
+        # Add to PATH and verify
+        export PATH="${UNCRUSTIFY_PATH}/bin:${PATH}"
+        echo "${UNCRUSTIFY_PATH}/bin" >> $GITHUB_PATH
+        uncrustify --version
+
+    - name: Find changed files and run uncrustify
+      id: uncrustify
+      shell: bash
+      run: |
+        CONFIG_PATH="${{ inputs.config-path }}"
+        FAIL_ON_ERROR="${{ inputs.fail-on-error }}"
+        EXTENSIONS="${{ inputs.extensions }}"
+        EXCLUDE_PATTERNS="${{ inputs.exclude-patterns }}"
+        
+        if [ ! -f "$CONFIG_PATH" ]; then
+          echo "::error::Uncrustify config file not found: $CONFIG_PATH"
+          exit 1
+        fi
+        
+        echo "Using config: $CONFIG_PATH"
+        echo "Extensions: $EXTENSIONS"
+        echo "Exclude patterns: $EXCLUDE_PATTERNS"
+        echo ""
+        
+        # Find changed files
+        echo "Comparing HEAD~1..HEAD"
+        CHANGED_FILES=$(git diff --name-only --diff-filter=ACMR HEAD~1..HEAD)
+        
+        echo "All changed files:"
+        echo "$CHANGED_FILES"
+        echo ""
+        
+        # Filter by extensions
+        FILES_TO_CHECK=""
+        IFS=',' read -ra EXT_ARRAY <<< "$EXTENSIONS"
+        for file in $CHANGED_FILES; do
+          for ext in "${EXT_ARRAY[@]}"; do
+            if [[ "$file" == *."$ext" ]]; then
+              FILES_TO_CHECK="$FILES_TO_CHECK $file"
+              break
+            fi
+          done
+        done
+        
+        # Apply exclude patterns
+        if [ -n "$EXCLUDE_PATTERNS" ]; then
+          FILTERED_FILES=""
+          EXCLUDE_ARRAY=()
+          INCLUDE_ARRAY=()
+          # Parse newline-separated patterns from GitHub Actions input
+          while IFS= read -r pattern; do
+            if [ -n "$pattern" ]; then
+              if [[ "$pattern" == !* ]]; then
+                # Remove the ! prefix for include patterns
+                INCLUDE_ARRAY+=("${pattern:1}")
+              else
+                EXCLUDE_ARRAY+=("$pattern")
+              fi
+            fi
+          done <<< "$EXCLUDE_PATTERNS"
+          
+          for file in $FILES_TO_CHECK; do
+            excluded=false
+            included=false
+            
+            # Check exclude patterns first
+            for pattern in "${EXCLUDE_ARRAY[@]}"; do
+              if [[ "$file" == $pattern ]]; then
+                excluded=true
+                break
+              fi
+            done
+            
+            # Check include patterns (negative patterns) to override excludes
+            if [ "$excluded" = true ]; then
+              for pattern in "${INCLUDE_ARRAY[@]}"; do
+                if [[ "$file" == $pattern ]]; then
+                  echo "Including $file (matches include pattern: !$pattern, overrides exclude)"
+                  included=true
+                  break
+                fi
+              done
+            fi
+            
+            if [ "$excluded" = true ] && [ "$included" = false ]; then
+              echo "Excluding $file (matches exclude pattern)"
+            else
+              FILTERED_FILES="$FILTERED_FILES $file"
+            fi
+          done
+          FILES_TO_CHECK="$FILTERED_FILES"
+        fi
+        
+        echo "Files to check after filtering:"
+        echo "$FILES_TO_CHECK"
+        echo ""
+        
+        formatting_needed="false"
+        files_changed=0
+        
+        for file in $FILES_TO_CHECK; do
+          if [ ! -f "$file" ]; then
+            echo "Skipping non-existent file: $file"
+            continue
+          fi
+          
+          file_fmt="${file}.tmp"
+          uncrustify -q -c "$CONFIG_PATH" -f "$file" -o "$file_fmt" || true
+          
+          diff -q -u "$file" "$file_fmt" >/dev/null 2>&1 || {
+            echo "Checking: $file"
+            echo "  ❌ Needs formatting"
+            colordiff -u "$file" "$file_fmt" || true
+            files_changed=$((files_changed + 1))
+            formatting_needed="true"
+          }
+          
+          rm -f "$file_fmt"
+        done
+        
+        echo "files-changed=$files_changed" >> $GITHUB_OUTPUT
+        echo "formatting-needed=$formatting_needed" >> $GITHUB_OUTPUT
+        
+        echo ""
+        echo "Summary:"
+        echo "  Files checked: $(echo $FILES_TO_CHECK | wc -w)"
+        echo "  Files needing changes: $files_changed"
+        echo "  Action needed: $formatting_needed"
+        
+        if [ "$formatting_needed" == "true" ] && [ "$FAIL_ON_ERROR" == "true" ]; then
+          echo ""
+          echo "::error::Code formatting issues found. Run uncrustify to fix them."
+          echo "Command to fix manually: uncrustify -c $CONFIG_PATH --replace --no-backup <file>"
+          exit 1
+        fi
